@@ -1,10 +1,100 @@
-import { useEffect } from "react";
-import { BrowserProvider, useBrowser } from "./state";
-import { ContextMenuLayer, StatusBar, TabBar, Toolbar } from "./components/Chrome";
+import { useEffect, type SyntheticEvent } from "react";
+import { BrowserProvider, useBrowser, type Action, type Tab } from "./state";
+import { ContextMenuLayer, Ic, StatusBar, TabBar, Toolbar } from "./components/Chrome";
 import StartPage from "./components/StartPage";
 import { CookiesPanel, DownloadsPanel, ExtensionsPanel, SettingsPanel } from "./components/Panels";
 import InspectorPanel from "./components/Inspector";
 import { buildLists, engine } from "./lib/engine";
+import { hostOf } from "./lib/lib";
+
+/* ---------------------------------------------------------------- frames */
+
+function FrameView({ tab, active, d }: { tab: Tab; active: boolean; d: (a: Action) => void }) {
+  /* Heuristic: a real cross-origin page throws SecurityError when we touch
+     contentWindow.location. An X-Frame-Options / CSP-refused frame stays at
+     about:blank, where href reads back as '' — that's our refusal signal. */
+  const onLoad = (e: SyntheticEvent<HTMLIFrameElement>) => {
+    d({ type: "loaded", id: tab.id });
+    if (!/^https?:/i.test(tab.url)) return;
+    const win = (e.target as HTMLIFrameElement).contentWindow;
+    window.setTimeout(() => {
+      try {
+        const href = win?.location?.href;
+        if (!href || href === "about:blank") d({ type: "frame-blocked", id: tab.id });
+      } catch {
+        /* SecurityError = a real page loaded through the tunnel — all good */
+      }
+    }, 900);
+  };
+
+  return (
+    <div className={`relative h-full ${active ? "" : "hidden"}`}>
+      <iframe
+        key={`${tab.id}:${tab.key}`}
+        title={tab.title}
+        src={tab.url}
+        className="frame"
+        sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-presentation allow-downloads"
+        referrerPolicy="no-referrer"
+        onLoad={onLoad}
+      />
+      {tab.blocked && active && <BlockedOverlay tab={tab} d={d} />}
+    </div>
+  );
+}
+
+function BlockedOverlay({ tab, d }: { tab: Tab; d: (a: Action) => void }) {
+  const host = hostOf(tab.url);
+  const act = "rounded-md border px-3 py-2 text-[12px] font-semibold transition-colors";
+  return (
+    <div className="fade-in absolute inset-0 z-20 flex items-center justify-center overflow-y-auto bg-bg0/95 p-6">
+      <div className="w-full max-w-[460px] rounded-lg border border-amber/35 bg-panel p-6">
+        <div className="flex items-center gap-3">
+          <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-md border border-amber/40 bg-amber/10 text-amber">
+            <Ic n="shield" s={20} />
+          </span>
+          <div>
+            <div className="font-display text-[16px] font-bold leading-tight text-ink">Frame embedding refused</div>
+            <div className="mt-0.5 font-mono text-[10px] tracking-wider text-amber">{host} · XFO / CSP FRAME-ANCESTORS</div>
+          </div>
+        </div>
+        <p className="mt-4 text-[12.5px] leading-relaxed text-mute">
+          <span className="text-ink">{host}</span> instructs browsers to block in-page embedding. The tunnel still
+          reaches it — pick how to proceed:
+        </p>
+        <div className="mt-4 grid grid-cols-2 gap-2">
+          <button
+            className={`${act} border-mint/45 bg-mint/10 text-mint hover:bg-mint/20`}
+            onClick={() => window.open(tab.url, "_blank", "noopener")}
+          >
+            Open direct ↗
+          </button>
+          <button
+            className={`${act} border-blue/45 bg-blue/10 text-blue hover:bg-blue/20`}
+            onClick={() => d({ type: "nav", id: tab.id, url: "https://txtify.it/" + tab.url })}
+          >
+            View as text
+          </button>
+          <button className={`${act} border-edge bg-bg1 text-ink hover:bg-panel2`} onClick={() => d({ type: "frame-retry", id: tab.id })}>
+            Retry embed
+          </button>
+          <button
+            className={`${act} border-edge bg-bg1 text-mute hover:bg-panel2`}
+            onClick={() => {
+              void navigator.clipboard?.writeText(tab.url).catch(() => {});
+            }}
+          >
+            Copy URL
+          </button>
+        </div>
+        <p className="mt-4 border-t border-edge pt-3 font-mono text-[9.5px] leading-relaxed text-dim">
+          FULL REWRITE MODE — run the wisp node (server/) behind deploy/: request-level tunneling strips framing
+          headers so every host renders inline, not just embed-friendly ones.
+        </p>
+      </div>
+    </div>
+  );
+}
 
 function Shell() {
   const { s, d } = useBrowser();
@@ -68,15 +158,7 @@ function Shell() {
               {t.id === s.active && <StartPage />}
             </div>
           ) : (
-            <iframe
-              key={`${t.id}:${t.key}`}
-              title={t.title}
-              src={t.url}
-              className={`frame ${t.id === s.active ? "" : "hidden"}`}
-              sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-presentation allow-downloads"
-              referrerPolicy="no-referrer"
-              onLoad={() => d({ type: "loaded", id: t.id })}
-            />
+            <FrameView key={t.id} tab={t} active={t.id === s.active} d={d} />
           )
         )}
 

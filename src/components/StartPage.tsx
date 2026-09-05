@@ -2,7 +2,6 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { activePreset, useBrowser } from "../state";
 import {
   CLOAK_PRESETS,
-  QUICK_TILES,
   faviconFor,
   fmtBytes,
   fmtClock,
@@ -11,6 +10,7 @@ import {
   normalizeUrl,
 } from "../lib/lib";
 import { buildLists, engine } from "../lib/engine";
+import { SITES, SITE_CATS, type SiteCat } from "../lib/sites";
 import { GhostMark, Ic, keyLabel } from "./Chrome";
 
 function Sparkline({ samples }: { samples: number[] }) {
@@ -24,13 +24,7 @@ function Sparkline({ samples }: { samples: number[] }) {
     <svg width={w} height={h} className="overflow-visible">
       <polyline points={pts} fill="none" stroke="#45E0A8" strokeWidth="1.6" strokeLinejoin="round" strokeLinecap="round" opacity="0.9" />
       {samples.length > 0 && (
-        <circle
-          cx={w}
-          cy={h - 3 - (samples[samples.length - 1] / max) * (h - 7)}
-          r="2.4"
-          fill="#45E0A8"
-          className="rise-glow"
-        />
+        <circle cx={w} cy={h - 3 - (samples[samples.length - 1] / max) * (h - 7)} r="2.4" fill="#45E0A8" className="rise-glow" />
       )}
     </svg>
   );
@@ -41,6 +35,8 @@ export default function StartPage() {
   const [val, setVal] = useState("");
   const [now, setNow] = useState(Date.now());
   const [samples, setSamples] = useState<number[]>([]);
+  const [cat, setCat] = useState<"all" | SiteCat>("all");
+  const [q, setQ] = useState("");
   const start = useRef(Date.now());
   const st = useMemo(() => {
     engine.load(buildLists(s.settings));
@@ -67,6 +63,12 @@ export default function StartPage() {
   };
 
   const preset = activePreset(s);
+  const ql = q.trim().toLowerCase();
+  const filtered = SITES.filter(
+    (x) =>
+      (cat === "all" || x.cat === cat) &&
+      (!ql || x.name.toLowerCase().includes(ql) || hostOf(x.url).includes(ql) || (x.tag ?? "").toLowerCase().includes(ql))
+  );
 
   return (
     <div
@@ -76,16 +78,14 @@ export default function StartPage() {
         d({ type: "ctx", ctx: { x: e.clientX, y: e.clientY, kind: "chrome" } });
       }}
     >
-      <div className="relative mx-auto max-w-[1080px] px-8 pb-14 pt-10">
+      <div className="relative mx-auto max-w-[1120px] px-8 pb-14 pt-10">
         {/* masthead */}
         <div className="flex items-start justify-between gap-6">
           <div className="flex items-center gap-3.5">
             <GhostMark s={40} />
             <div>
               <div className="flex items-baseline gap-3">
-                <h1 className="font-display text-[26px] font-bold leading-none tracking-[0.22em] text-ink">
-                  WRAITH
-                </h1>
+                <h1 className="font-display text-[26px] font-bold leading-none tracking-[0.22em] text-ink">WRAITH</h1>
                 <span className="rounded border border-mint/35 bg-mint/8 px-1.5 py-0.5 font-mono text-[9.5px] tracking-[0.14em] text-mint">
                   WISP-CORE 0.9.2
                 </span>
@@ -107,7 +107,7 @@ export default function StartPage() {
         {/* omnibox */}
         <form onSubmit={submit} className="mt-9">
           <label className="mb-2 block font-mono text-[10px] tracking-[0.2em] text-dim">
-            OMNIBOX — DIRECT HOST OR PROXIED SEARCH
+            OMNIBOX — EVERY HOST TUNNELS, NOT JUST THE DIRECTORY
           </label>
           <div className="group flex h-[54px] items-center gap-3 rounded-lg border border-edge bg-panel px-4 transition-all focus-within:border-mint focus-within:shadow-[0_0_0_4px_rgba(69,224,168,0.1)]">
             <span className="text-mint">
@@ -117,7 +117,7 @@ export default function StartPage() {
               autoFocus
               value={val}
               onChange={(e) => setVal(e.target.value)}
-              placeholder="wraith tunnels anything — try wikipedia.org or a search query"
+              placeholder="type any host or search — youtube.com, reddit.com, anything…"
               spellCheck={false}
               className="h-full min-w-0 flex-1 bg-transparent font-mono text-[14px] text-ink placeholder:text-dim"
             />
@@ -125,40 +125,91 @@ export default function StartPage() {
               <kbd>↵</kbd> tunnel
             </span>
           </div>
+          <p className="mt-2 font-mono text-[9.5px] tracking-[0.1em] text-dim">
+            SITES THAT REFUSE FRAMING (XFO/CSP) ARE DETECTED LIVE AND OFFER DIRECT-MODE + TEXT-MODE FALLBACK
+          </p>
         </form>
 
         {/* deck grid */}
         <div className="mt-9 grid gap-6 lg:grid-cols-[1fr_340px]">
-          {/* quick access */}
+          {/* directory */}
           <div>
-            <div className="mb-2.5 flex items-center justify-between">
-              <span className="font-mono text-[10px] tracking-[0.2em] text-dim">QUICK ACCESS — FRAME-PERMISSIVE</span>
-              <span className="font-mono text-[10px] text-dim">{QUICK_TILES.length} nodes</span>
+            <div className="mb-2.5 flex flex-wrap items-center justify-between gap-2">
+              <span className="font-mono text-[10px] tracking-[0.2em] text-dim">
+                SITE DIRECTORY — {filtered.length}/{SITES.length} NODES
+              </span>
+              <div className="relative">
+                <input
+                  value={q}
+                  onChange={(e) => setQ(e.target.value)}
+                  placeholder="filter directory…"
+                  spellCheck={false}
+                  className="field field-mono !w-[190px] !py-1.5 !text-[11px]"
+                />
+              </div>
             </div>
-            <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-4">
-              {QUICK_TILES.map((t) => (
+
+            <div className="mb-3 flex flex-wrap gap-1.5">
+              <button className={`chip ${cat === "all" ? "on" : ""}`} onClick={() => setCat("all")}>
+                ALL · {SITES.length}
+              </button>
+              {SITE_CATS.map((c) => {
+                const n = SITES.filter((x) => x.cat === c.id).length;
+                return (
+                  <button key={c.id} className={`chip ${cat === c.id ? "on" : ""}`} onClick={() => setCat(cat === c.id ? "all" : c.id)}>
+                    {c.label.toUpperCase()} · {n}
+                  </button>
+                );
+              })}
+            </div>
+
+            {filtered.length === 0 ? (
+              <div className="rounded-md border border-dashed border-edge p-8 text-center">
+                <div className="font-mono text-[11px] text-mute">no directory match for “{q}”</div>
                 <button
-                  key={t.url}
-                  onClick={() => d({ type: "nav", id: s.active, url: t.url })}
-                  className="group flex flex-col items-start gap-2.5 rounded-md border border-edge bg-panel p-3 text-left transition-all duration-150 hover:-translate-y-[2px] hover:border-mint/45 hover:shadow-[0_10px_28px_rgba(0,0,0,0.35)]"
+                  className="mt-3 rounded-md border border-mint/45 bg-mint/10 px-3 py-1.5 text-[12px] font-semibold text-mint hover:bg-mint/20"
+                  onClick={() => {
+                    const u = normalizeUrl(q) ?? `https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(q)}`;
+                    d({ type: "nav", id: s.active, url: u });
+                  }}
                 >
-                  <img
-                    src={faviconFor(hostOf(t.url))}
-                    alt=""
-                    className="h-[18px] w-[18px] rounded-[4px]"
-                    onError={(e) => ((e.target as HTMLImageElement).style.visibility = "hidden")}
-                  />
-                  <div className="min-w-0">
-                    <div className="truncate text-[12.5px] font-semibold text-ink group-hover:text-mint">
-                      {t.name}
-                    </div>
-                    <div className="mt-0.5 truncate font-mono text-[9.5px] tracking-wider text-dim">
-                      {hostOf(t.url)} · {t.note}
-                    </div>
-                  </div>
+                  Tunnel “{q}” anyway ↵
                 </button>
-              ))}
-            </div>
+              </div>
+            ) : (
+              <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-3 xl:grid-cols-4">
+                {filtered.map((t) => (
+                  <button
+                    key={t.url}
+                    onClick={() => d({ type: "nav", id: s.active, url: t.url })}
+                    className="group flex flex-col items-start gap-2.5 rounded-md border border-edge bg-panel p-3 text-left transition-all duration-150 hover:-translate-y-[2px] hover:border-mint/45 hover:shadow-[0_10px_28px_rgba(0,0,0,0.35)]"
+                  >
+                    <div className="flex w-full items-center justify-between">
+                      <img
+                        src={faviconFor(hostOf(t.url))}
+                        alt=""
+                        className="h-[18px] w-[18px] rounded-[4px]"
+                        onError={(e) => ((e.target as HTMLImageElement).style.visibility = "hidden")}
+                      />
+                      <span
+                        className={`rounded-sm border px-1 py-px font-mono text-[8px] tracking-[0.12em] ${
+                          t.direct ? "border-amber/45 text-amber" : "border-mint/40 text-mint"
+                        }`}
+                      >
+                        {t.direct ? "DIRECT" : "EMBED"}
+                      </span>
+                    </div>
+                    <div className="min-w-0">
+                      <div className="truncate text-[12.5px] font-semibold text-ink group-hover:text-mint">{t.name}</div>
+                      <div className="mt-0.5 truncate font-mono text-[9.5px] tracking-wider text-dim">
+                        {hostOf(t.url)}
+                        {t.tag ? ` · ${t.tag}` : ""}
+                      </div>
+                    </div>
+                  </button>
+                ))}
+              </div>
+            )}
 
             <div className="mt-7 mb-2.5 font-mono text-[10px] tracking-[0.2em] text-dim">KEYBOARD PROTOCOL</div>
             <div className="grid grid-cols-2 gap-x-6 gap-y-2 rounded-md border border-edge bg-panel/60 p-3.5 sm:grid-cols-3">
@@ -249,7 +300,12 @@ export default function StartPage() {
                         else d({ type: "cloak", on: true });
                       }}
                     >
-                      <img src={p.icon} alt="" className="h-[12px] w-[12px] rounded-[2px]" onError={(e) => ((e.target as HTMLImageElement).style.visibility = "hidden")} />
+                      <img
+                        src={p.icon}
+                        alt=""
+                        className="h-[12px] w-[12px] rounded-[2px]"
+                        onError={(e) => ((e.target as HTMLImageElement).style.visibility = "hidden")}
+                      />
                       {p.name}
                     </button>
                   );

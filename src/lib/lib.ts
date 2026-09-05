@@ -126,23 +126,8 @@ export const LS = {
   blocked: "wraith.blocked.v1",
 };
 
-export interface QuickTile {
-  name: string;
-  url: string;
-  note: string;
-}
-
-/** Frame-permissive destinations used by the quick-access deck. */
-export const QUICK_TILES: QuickTile[] = [
-  { name: "Wikipedia", url: "https://en.m.wikipedia.org/wiki/Main_Page", note: "enc" },
-  { name: "DuckDuckGo Lite", url: "https://lite.duckduckgo.com/lite/", note: "srch" },
-  { name: "OpenStreetMap", url: "https://www.openstreetmap.org/export/embed.html?bbox=-0.15,51.49,-0.09,51.52", note: "map" },
-  { name: "wttr.in", url: "https://wttr.in/?F", note: "wx" },
-  { name: "NPR Text", url: "https://text.npr.org/", note: "news" },
-  { name: "info.cern.ch", url: "http://info.cern.ch/", note: "1991" },
-  { name: "httpbin", url: "https://httpbin.org/", note: "api" },
-  { name: "Example", url: "https://example.com/", note: "rfc" },
-];
+/* Site directory lives in src/lib/sites.ts — every host tunnels via the
+   omnibox regardless; the directory is curation, not a whitelist. */
 
 export const WRAITH_CORE_LIST = `! wraith-core — bundled interception rules (ABP syntax)
 [Adblock Plus 3.1]

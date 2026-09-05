@@ -35,6 +35,7 @@ export interface Tab {
   hist: string[];
   idx: number;
   key: number; // remount counter (reload)
+  blocked?: boolean; // site refused frame embedding (XFO / CSP frame-ancestors)
 }
 
 export interface Settings {
@@ -117,6 +118,8 @@ export type Action =
   | { type: "fwd"; id: string }
   | { type: "reload"; id: string }
   | { type: "loaded"; id: string }
+  | { type: "frame-blocked"; id: string }
+  | { type: "frame-retry"; id: string }
   | { type: "panel"; panel: PanelId }
   | { type: "cloak"; on?: boolean }
   | { type: "settings"; patch: Partial<Settings> }
@@ -270,6 +273,7 @@ function reducer(s: State, a: Action): State {
           title: host || "New Tab",
           icon: faviconFor(host),
           status: a.url ? "loading" : "start",
+          blocked: undefined,
           key: t.key + 1,
         };
       });
@@ -278,21 +282,25 @@ function reducer(s: State, a: Action): State {
         if (t.idx <= 0) return t;
         const idx = t.idx - 1;
         const url = t.hist[idx];
-        return { ...t, idx, url, title: url ? hostOf(url) : "New Tab", icon: url ? faviconFor(hostOf(url)) : "", status: url ? "loading" : "start", key: t.key + 1 };
+        return { ...t, idx, url, title: url ? hostOf(url) : "New Tab", icon: url ? faviconFor(hostOf(url)) : "", status: url ? "loading" : "start", blocked: undefined, key: t.key + 1 };
       });
     case "fwd":
       return patchTab(s, a.id, (t) => {
         if (t.idx >= t.hist.length - 1) return t;
         const idx = t.idx + 1;
         const url = t.hist[idx];
-        return { ...t, idx, url, title: url ? hostOf(url) : "New Tab", icon: url ? faviconFor(hostOf(url)) : "", status: "loading", key: t.key + 1 };
+        return { ...t, idx, url, title: url ? hostOf(url) : "New Tab", icon: url ? faviconFor(hostOf(url)) : "", status: "loading", blocked: undefined, key: t.key + 1 };
       });
     case "reload":
       return patchTab(s, a.id, (t) =>
-        t.url ? { ...t, key: t.key + 1, status: "loading" } : t
+        t.url ? { ...t, key: t.key + 1, status: "loading", blocked: undefined } : t
       );
     case "loaded":
       return patchTab(s, a.id, (t) => ({ ...t, status: t.url ? "loaded" : "start" }));
+    case "frame-blocked":
+      return patchTab(s, a.id, (t) => ({ ...t, blocked: true, status: "loaded" }));
+    case "frame-retry":
+      return patchTab(s, a.id, (t) => ({ ...t, blocked: false, status: "loading", key: t.key + 1 }));
     case "panel":
       return { ...s, panel: s.panel === a.panel ? null : a.panel, menuOpen: false };
     case "cloak": {
