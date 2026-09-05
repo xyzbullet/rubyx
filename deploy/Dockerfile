@@ -6,7 +6,9 @@
 #   runtime: nginx (shell) + wraith-server (tunnel) + optional tor
 # ============================================================
 
-FROM rust:1.82-slim AS rust
+# ≥ 1.85 required: transitive deps (url → idna → icu_properties_data 2.x)
+# are published with edition2024, stabilized in Rust 1.85.0
+FROM rust:1.88-slim-bookworm AS rust
 WORKDIR /build
 COPY server/Cargo.toml server/Cargo.toml
 COPY server/src server/src
