@@ -346,3 +346,41 @@ iframe.frame {
   height: 100%;
   background: #fff;
 }
+
+/* ---------------- light theme ----------------
+   Variables cascade everywhere; components never hard-code dark values. */
+html.light {
+  --color-bg0: #e8ecf1;
+  --color-bg1: #f1f4f8;
+  --color-panel: #ffffff;
+  --color-panel2: #edf1f6;
+  --color-raise: #e1e8f0;
+  --color-edge: #d3dce6;
+  --color-edge2: #b7c6d6;
+  --color-ink: #182130;
+  --color-mute: #55657a;
+  --color-dim: #8494a7;
+  --color-mint: #0e9d70;
+  --color-mintd: #cdeee2;
+  --color-amber: #b25e09;
+  --color-red: #d92c52;
+  --color-blue: #2563a8;
+  --color-viol: #7c5cd6;
+  color-scheme: light;
+}
+html.light body {
+  background: var(--color-bg0);
+}
+html.light .deck-bg {
+  background-image:
+    radial-gradient(rgba(24, 33, 48, 0.06) 1px, transparent 1px),
+    radial-gradient(ellipse 60% 42% at 12% -8%, rgba(14, 157, 112, 0.09), transparent 60%),
+    radial-gradient(ellipse 48% 40% at 96% 12%, rgba(37, 99, 168, 0.07), transparent 60%),
+    radial-gradient(ellipse 52% 44% at 55% 118%, rgba(178, 94, 9, 0.05), transparent 62%);
+}
+html.light .noise::before {
+  opacity: 0.028;
+}
+html.light kbd {
+  background: var(--color-panel2);
+}

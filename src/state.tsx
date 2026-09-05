@@ -41,6 +41,7 @@ export interface Tab {
 export interface Settings {
   gateway: string;
   transport: "ws" | "polling";
+  theme?: "dark" | "light";
   adblock: boolean;
   lists: { id: string; name: string; enabled: boolean }[];
   customList: string;

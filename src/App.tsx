@@ -1,15 +1,22 @@
-import { useEffect, type SyntheticEvent } from "react";
+import { useEffect, useState, type SyntheticEvent } from "react";
 import { BrowserProvider, useBrowser, type Action, type Tab } from "./state";
 import { ContextMenuLayer, Ic, StatusBar, TabBar, Toolbar } from "./components/Chrome";
 import StartPage from "./components/StartPage";
 import { CookiesPanel, DownloadsPanel, ExtensionsPanel, SettingsPanel } from "./components/Panels";
 import InspectorPanel from "./components/Inspector";
 import { buildLists, engine } from "./lib/engine";
+import { toProxyUrl } from "./lib/proxy";
 import { hostOf } from "./lib/lib";
 
 /* ---------------------------------------------------------------- frames */
 
-function FrameView({ tab, active, d }: { tab: Tab; active: boolean; d: (a: Action) => void }) {
+function FrameView({ tab, active, d, swReady }: { tab: Tab; active: boolean; d: (a: Action) => void; swReady: boolean }) {
+  /* If this tab was refused before the SW owned the scope, retry through
+     the rewriting proxy the moment it comes online. */
+  useEffect(() => {
+    if (swReady && tab.blocked) d({ type: "frame-retry", id: tab.id });
+  }, [swReady]); // eslint-disable-line react-hooks/exhaustive-deps
+
   /* Heuristic: a real cross-origin page throws SecurityError when we touch
      contentWindow.location. An X-Frame-Options / CSP-refused frame stays at
      about:blank, where href reads back as '' — that's our refusal signal. */
@@ -32,7 +39,7 @@ function FrameView({ tab, active, d }: { tab: Tab; active: boolean; d: (a: Actio
       <iframe
         key={`${tab.id}:${tab.key}`}
         title={tab.title}
-        src={tab.url}
+        src={swReady ? toProxyUrl(tab.url) : tab.url}
         className="frame"
         sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-presentation allow-downloads"
         referrerPolicy="no-referrer"
@@ -118,6 +125,25 @@ function Shell() {
     });
   }, [s.settings.adblock, s.settings.lists, s.settings.customList]);
 
+  /* proxied links only work once the SW owns the scope */
+  const [swReady, setSwReady] = useState(!!navigator.serviceWorker?.controller);
+  useEffect(() => {
+    navigator.serviceWorker?.ready.then(() => setSwReady(true)).catch(() => {});
+  }, []);
+
+  /* theme — flips the variable set the whole shell keys off */
+  useEffect(() => {
+    document.documentElement.classList.toggle("light", s.settings.theme === "light");
+  }, [s.settings.theme]);
+
+  /* ask the SW to open the encrypted wisp tunnel */
+  useEffect(() => {
+    navigator.serviceWorker?.controller?.postMessage({
+      type: "connect-tunnel",
+      gateway: s.settings.transport === "ws" ? s.settings.gateway : "",
+    });
+  }, [s.settings.gateway, s.settings.transport]);
+
   /* browser-grade keybindings */
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -158,7 +184,7 @@ function Shell() {
               {t.id === s.active && <StartPage />}
             </div>
           ) : (
-            <FrameView key={t.id} tab={t} active={t.id === s.active} d={d} />
+            <FrameView key={t.id} tab={t} active={t.id === s.active} d={d} swReady={swReady} />
           )
         )}
 

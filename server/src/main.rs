@@ -9,6 +9,7 @@
 //! Clients that cannot hold WebSockets (serverless hosts) fall back to the
 //! chunked HTTP polling transport served on the same port.
 
+mod crypto;
 mod socks;
 mod wisp;
 
