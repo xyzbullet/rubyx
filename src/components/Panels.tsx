@@ -358,7 +358,30 @@ export function SettingsPanel({ onClose }: { onClose: () => void }) {
   };
 
   return (
-    <Drawer title="Settings" sub="GATEWAY · SHIELDS · STEALTH" onClose={onClose}>
+    <Drawer title="Settings" sub="THEME · GATEWAY · SHIELDS · STEALTH" onClose={onClose}>
+      <Sect title="APPEARANCE">
+        <div className="flex items-center gap-2">
+          {([
+            ["dark", "DARK"],
+            ["light", "LIGHT"],
+          ] as const).map(([t, label]) => (
+            <button
+              key={t}
+              className={`chip ${(s.settings.theme ?? "dark") === t ? "on" : ""}`}
+              onClick={() => set({ theme: t })}
+            >
+              <span
+                className={`h-[10px] w-[10px] rounded-full border ${
+                  t === "dark" ? "border-edge2 bg-[#10151D]" : "border-[#b7c6d6] bg-[#f1f4f8]"
+                }`}
+              />
+              {label}
+            </button>
+          ))}
+          <span className="ml-auto font-mono text-[9.5px] tracking-wider text-dim">APPLIES INSTANTLY · PERSISTED</span>
+        </div>
+      </Sect>
+
       <Sect title="WISP GATEWAY">
         <input
           className="field field-mono"

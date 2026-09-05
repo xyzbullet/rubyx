@@ -1,17 +1,20 @@
-//! Wisp frame multiplexer over WebSocket.
+//! Wisp frame multiplexer over WebSocket — encrypted end to end.
 //!
 //! Frame layout (little-endian):
-//!   u32 length (payload + 5) | u8 type | u32 stream_id | payload
+//!   u32 length (payload+5) | u8 type | u32 stream_id | payload
 //!
-//!   type 0x01 CONNECT  payload: u8 proto (1=tcp,2=udp) | utf8 "host:port"
-//!   type 0x02 DATA     payload: raw bytes
-//!   type 0x03 END      payload: empty (peer half-close)
-//!   type 0x04 UDP      payload: u16 addr_len | addr | datagram
-//!   type 0x05 EXTEND   payload: u32 new buffer window
+//!   0x01 CONNECT  u8 proto (1 tcp · 2 udp · 3 l7-fetch) | utf8 "host:port"
+//!   0x02 DATA     raw stream bytes
+//!   0x03 END      half-close / response complete
+//!   0x04 UDP      datagram
+//!   0x05 EXTEND   window update
+//!   0x06 REQ      L7: full HTTP request bytes  (client → node)
+//!   0x07 RES      L7: full HTTP response bytes (node → client)
 //!
-//! Each CONNECT spawns a duplex pump between the socket and the WS sink, so
-//! thousands of streams share one handshake. DNS happens on-node via
-//! hickory with a TTL cache — clients never leak resolution latency.
+//! Transport encryption: the first text frame is a JSON handshake
+//! { v: 1, pub: <b64 X25519> }; both sides derive
+//! HKDF-SHA256(ECDH, "wraith-wisp-v1", "wisp-gcm-aes256") and every
+//! binary message after is  nonce(12) || AES-256-GCM(frame).
 
 use std::sync::Arc;
 
@@ -22,11 +25,15 @@ use hickory_resolver::{
     config::{NameServerConfig, Protocol, ResolverConfig, ResolverOpts},
     TokioAsyncResolver,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use rustls::ClientConfig;
+use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
+use tokio_rustls::{client::TlsStream, TlsConnector};
 use tokio_tungstenite::tungstenite::Message;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
+use crate::crypto::{Cipher, KeyExchange};
 use crate::socks;
 
 pub struct Config {
@@ -40,27 +47,52 @@ const T_DATA: u8 = 0x02;
 const T_END: u8 = 0x03;
 const T_UDP: u8 = 0x04;
 const T_EXTEND: u8 = 0x05;
+const T_REQ: u8 = 0x06;
+const T_RES: u8 = 0x07;
+
+type Io = Box<dyn AsyncRead + AsyncWrite + Unpin + Send>;
 
 #[derive(Clone)]
 enum StreamHandle {
-    Tcp(Arc<tokio::sync::Mutex<TcpStream>>),
+    Io(Arc<tokio::sync::Mutex<Io>>),
     Udp(Arc<UdpSocket>),
 }
 
 type Streams = Arc<DashMap<u32, StreamHandle>>;
 
-fn make_resolver(cfg: &Config) -> Result<TokioAsyncResolver> {
+fn resolver(cfg: &Config) -> Result<TokioAsyncResolver> {
     let mut opts = ResolverOpts::default();
     opts.cache_size = 4096;
-    let server = cfg.dns.parse().context("bad --dns addr")?;
-    // `new` is the stable cross-version constructor (0.21 → 0.25+);
-    // field literals differ across minors, so they are avoided on purpose.
-    let mut ns = NameServerConfig::new(server, Protocol::Udp);
-    ns.trust_negative_responses = true;
+    let addr = cfg.dns.parse().context("bad --dns addr")?;
+    let ns = NameServerConfig::new(addr, Protocol::Udp);
     Ok(TokioAsyncResolver::tokio(
-        ResolverConfig::from_parts(None, vec![], vec![ns]),
+        ResolverConfig::from_parts(None, Vec::new(), vec![ns]),
         opts,
     ))
+}
+
+fn tls_connector() -> TlsConnector {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let cfg = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    TlsConnector::from(Arc::new(cfg))
+}
+
+#[derive(Deserialize)]
+struct HandshakeIn {
+    #[allow(dead_code)]
+    v: u32,
+    #[serde(rename = "pub")]
+    pub_key: String,
+}
+
+#[derive(Serialize)]
+struct HandshakeOut {
+    v: u32,
+    #[serde(rename = "pub")]
+    pub_key: String,
 }
 
 pub async fn serve_conn(stream: TcpStream, cfg: Arc<Config>) -> Result<()> {
@@ -69,92 +101,169 @@ pub async fn serve_conn(stream: TcpStream, cfg: Arc<Config>) -> Result<()> {
         .context("ws handshake failed")?;
     let (mut sink, mut rx) = ws.split();
 
+    /* ---- E2E handshake (first text frame) ---- */
+    let mut cipher: Option<Cipher> = None;
+    let first = rx.next().await.context("conn closed before handshake")??;
+    let first_binary = match first {
+        Message::Text(t) => {
+            let hs: HandshakeIn = serde_json::from_str(&t).context("bad handshake json")?;
+            let kx = KeyExchange::new();
+            let shared = kx
+                .shared_from_peer_b64(&hs.pub_key)
+                .ok_or_else(|| anyhow!("bad peer public key"))?;
+            cipher = Some(Cipher::from_shared(&shared));
+            sink.send(Message::Text(
+                serde_json::to_string(&HandshakeOut {
+                    v: 1,
+                    pub_key: kx.public_b64(),
+                })
+                .unwrap_or_default(),
+            ))
+            .await?;
+            info!("e2e cipher established (x25519 + aes-256-gcm)");
+            None
+        }
+        Message::Binary(b) => Some(b), // legacy unencrypted client
+        _ => None,
+    };
+
     let streams: Streams = Arc::new(DashMap::new());
-    let dns = Arc::new(make_resolver(&cfg)?);
+    let resolver = Arc::new(resolver(&cfg)?);
+    let connector = Arc::new(tls_connector());
     let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1024);
 
-    // egress pump: frames produced by per-stream readers -> ws sink
+    /* ---- egress pump: per-stream frames -> encrypted ws sink ---- */
+    let cipher_out = cipher.clone();
     let pump = tokio::spawn(async move {
-        while let Some(f) = frame_rx.recv().await {
-            if sink.send(Message::Binary(f.into())).await.is_err() {
+        while let Some(frame) = frame_rx.recv().await {
+            let msg = match &cipher_out {
+                Some(c) => Message::Binary(c.seal(&frame).into()),
+                None => Message::Binary(frame.into()),
+            };
+            if sink.send(msg).await.is_err() {
                 break;
             }
         }
     });
 
-    while let Some(msg) = rx.next().await {
-        let msg = msg.context("ws read")?;
-        let (ty, sid, payload) = match decode(msg) {
-            Some(f) => f,
-            None => continue,
-        };
+    let process = |frame: Vec<u8>,
+                   streams: &Streams,
+                   cfg: &Arc<Config>,
+                   resolver: &Arc<TokioAsyncResolver>,
+                   connector: &Arc<TlsConnector>,
+                   tx: &tokio::sync::mpsc::Sender<Vec<u8>>| async move {
+        if frame.len() < 9 {
+            return Ok(());
+        }
+        let ty = frame[4];
+        let sid = u32::from_le_bytes([frame[5], frame[6], frame[7], frame[8]]);
+        let payload = &frame[9..];
+
         match ty {
             T_CONNECT => {
-                if payload.len() < 2 {
-                    continue;
-                }
-                let proto = payload[0];
+                let proto = payload.first().copied().unwrap_or(1);
                 let target = String::from_utf8_lossy(&payload[1..]).to_string();
-                info!("stream {sid} connect {} -> {target}", if proto == 2 { "udp" } else { "tcp" });
-                let handle = open_stream(&cfg, &dns, proto, &target).await?;
-                streams.insert(sid, handle.clone());
-                spawn_stream_pump(sid, handle, frame_tx.clone(), streams.clone());
+                info!("stream {sid} connect proto={proto} -> {target}");
+                match proto {
+                    3 => {
+                        // L7 fetch mode: node terminates TLS for the client
+                        let stream = open_l7(cfg, resolver, connector, &target).await?;
+                        streams.insert(sid, StreamHandle::Io(Arc::new(tokio::sync::Mutex::new(stream))));
+                    }
+                    2 => {
+                        let handle = StreamHandle::Udp(open_udp(resolver, &target).await?);
+                        streams.insert(sid, handle.clone());
+                        spawn_io_pump(sid, handle, tx.clone(), streams.clone());
+                    }
+                    _ => {
+                        let stream = open_tcp(cfg, resolver, &target).await?;
+                        let handle = StreamHandle::Io(Arc::new(tokio::sync::Mutex::new(stream)));
+                        streams.insert(sid, handle.clone());
+                        spawn_io_pump(sid, handle, tx.clone(), streams.clone());
+                    }
+                }
             }
             T_DATA => {
                 if let Some(h) = streams.get(&sid) {
-                    let h = h.value().clone();
-                    tokio::spawn(async move {
-                        if let StreamHandle::Tcp(sock) = h {
+                    if let StreamHandle::Io(sock) = h.value().clone() {
+                        let data = payload.to_vec();
+                        tokio::spawn(async move {
                             let mut s = sock.lock().await;
-                            let _ = s.write_all(&payload).await;
-                        }
-                    });
+                            let _ = s.write_all(&data).await;
+                        });
+                    }
+                }
+            }
+            T_REQ => {
+                // L7 round trip: write request, read until EOF, send RES + END
+                if let Some(h) = streams.get(&sid) {
+                    if let StreamHandle::Io(sock) = h.value().clone() {
+                        let req = payload.to_vec();
+                        let tx = tx.clone();
+                        let streams2 = streams.clone();
+                        tokio::spawn(async move {
+                            let res = l7_roundtrip(sock, &req).await;
+                            match res {
+                                Some(bytes) => {
+                                    let _ = tx.send(frame(T_RES, sid, &bytes)).await;
+                                }
+                                None => warn!("stream {sid}: l7 fetch failed"),
+                            }
+                            let _ = tx.send(frame(T_END, sid, &[])).await;
+                            streams2.remove(&sid);
+                        });
+                    }
                 }
             }
             T_UDP => {
-                if payload.len() < 2 {
-                    continue;
-                }
-                let alen = u16::from_be_bytes([payload[0], payload[1]]) as usize;
-                if payload.len() < 2 + alen {
-                    continue;
-                }
-                if let Some(StreamHandle::Udp(sock)) = streams.get(&sid).map(|h| h.value().clone()) {
-                    let datagram = payload[2 + alen..].to_vec();
-                    tokio::spawn(async move {
-                        let _ = sock.send(&datagram).await;
-                    });
+                if payload.len() >= 2 {
+                    if let Some(StreamHandle::Udp(sock)) =
+                        streams.get(&sid).map(|h| h.value().clone())
+                    {
+                        let datagram = payload.to_vec();
+                        tokio::spawn(async move {
+                            let _ = sock.send(&datagram).await;
+                        });
+                    }
                 }
             }
             T_END => {
                 streams.remove(&sid);
             }
-            T_EXTEND => {
-                debug!("stream {sid} window extended");
-            }
+            T_EXTEND => debug!("stream {sid} window extended"),
             _ => {}
+        }
+        Ok::<(), anyhow::Error>(())
+    };
+
+    if let Some(b) = first_binary {
+        let _ = process(b.to_vec(), &streams, &cfg, &resolver, &connector, &frame_tx).await;
+    }
+
+    while let Some(msg) = rx.next().await {
+        let msg = msg.context("ws read")?;
+        let frame = match msg {
+            Message::Binary(b) => match &cipher {
+                Some(c) => match c.open(b.as_ref()) {
+                    Some(f) => f,
+                    None => {
+                        warn!("dropped frame: gcm auth failed");
+                        continue;
+                    }
+                },
+                None => b.to_vec(),
+            },
+            Message::Close(_) => break,
+            _ => continue,
+        };
+        if let Err(e) = process(frame, &streams, &cfg, &resolver, &connector, &frame_tx).await {
+            warn!("frame error: {e:#}");
         }
     }
 
     drop(frame_tx);
     let _ = pump.await;
     Ok(())
-}
-
-/// Parse one wisp frame. Works over any `Deref<Target = [u8]>` payload
-/// (tungstenite `Bytes` or `Vec<u8>`) — no `as_ref` inference games.
-fn decode(msg: Message) -> Option<(u8, u32, Vec<u8>)> {
-    let data = match msg {
-        Message::Binary(b) => b,
-        _ => return None,
-    };
-    let bytes: &[u8] = &data;
-    if bytes.len() < 9 {
-        return None;
-    }
-    let ty = bytes[4];
-    let sid = u32::from_le_bytes(bytes[5..9].try_into().ok()?);
-    Some((ty, sid, bytes[9..].to_vec()))
 }
 
 fn frame(ty: u8, sid: u32, payload: &[u8]) -> Vec<u8> {
@@ -166,51 +275,82 @@ fn frame(ty: u8, sid: u32, payload: &[u8]) -> Vec<u8> {
     out
 }
 
-async fn open_stream(
-    cfg: &Config,
-    dns: &TokioAsyncResolver,
-    proto: u8,
-    target: &str,
-) -> Result<StreamHandle> {
-    let (host, port) = target
-        .rsplit_once(':')
-        .ok_or_else(|| anyhow!("bad target {target}"))?;
-    let port: u16 = port.parse().context("bad port")?;
-
-    // .onion destinations bridge via the local Tor SOCKS listener;
-    // hostnames go verbatim (ATYP 0x03) so resolution stays inside the circuit.
-    if host.ends_with(".onion") {
-        let sock = socks::connect_via_socks(&cfg.tor_socks, host, port).await?;
-        return Ok(StreamHandle::Tcp(Arc::new(tokio::sync::Mutex::new(sock))));
+async fn resolve_host(
+    resolver: &TokioAsyncResolver,
+    host: &str,
+    port: u16,
+) -> Result<std::net::SocketAddr> {
+    // literal IPs skip DNS entirely
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return Ok(std::net::SocketAddr::new(ip, port));
     }
-    // regional swapping: everything through the configured SOCKS5 upstream
-    if let Some(upstream) = &cfg.socks5 {
-        let sock = socks::connect_via_socks(upstream, host, port).await?;
-        return Ok(StreamHandle::Tcp(Arc::new(tokio::sync::Mutex::new(sock))));
-    }
-
-    if proto == 2 {
-        let addrs = dns.lookup_ip(host).await?;
-        let ip = addrs
-            .iter()
-            .next()
-            .ok_or_else(|| anyhow!("no A/AAAA records for {host}"))?;
-        let sock = UdpSocket::bind("0.0.0.0:0").await?;
-        sock.connect(std::net::SocketAddr::new(ip, port)).await?;
-        Ok(StreamHandle::Udp(Arc::new(sock)))
-    } else {
-        let addrs = dns.lookup_ip(host).await?;
-        let ip = addrs
-            .iter()
-            .next()
-            .ok_or_else(|| anyhow!("no A/AAAA records for {host}"))?;
-        let sock = TcpStream::connect(std::net::SocketAddr::new(ip, port)).await?;
-        sock.set_nodelay(true)?;
-        Ok(StreamHandle::Tcp(Arc::new(tokio::sync::Mutex::new(sock))))
-    }
+    let addrs = resolver.lookup_ip(host).await?;
+    let ip = addrs.iter().next().ok_or_else(|| anyhow!("no A/AAAA for {host}"))?;
+    Ok(std::net::SocketAddr::new(ip, port))
 }
 
-fn spawn_stream_pump(
+async fn open_tcp(cfg: &Config, resolver: &TokioAsyncResolver, target: &str) -> Result<Io> {
+    let (host, port) = target.rsplit_once(':').ok_or_else(|| anyhow!("bad target {target}"))?;
+    let port: u16 = port.parse()?;
+
+    if host.ends_with(".onion") {
+        let sock = socks::connect_via_socks(&cfg.tor_socks, host, port).await?;
+        return Ok(Box::new(sock));
+    }
+    if let Some(upstream) = &cfg.socks5 {
+        let sock = socks::connect_via_socks(upstream, host, port).await?;
+        return Ok(Box::new(sock));
+    }
+    let remote = resolve_host(resolver, host, port).await?;
+    let sock = TcpStream::connect(remote).await?;
+    sock.set_nodelay(true)?;
+    Ok(Box::new(sock))
+}
+
+async fn open_udp(resolver: &TokioAsyncResolver, target: &str) -> Result<Arc<UdpSocket>> {
+    let (host, port) = target.rsplit_once(':').ok_or_else(|| anyhow!("bad target {target}"))?;
+    let port: u16 = port.parse()?;
+    let remote = resolve_host(resolver, host, port).await?;
+    let sock = UdpSocket::bind("0.0.0.0:0").await?;
+    sock.connect(remote).await?;
+    Ok(Arc::new(sock))
+}
+
+async fn open_l7(
+    cfg: &Config,
+    resolver: &TokioAsyncResolver,
+    connector: &TlsConnector,
+    target: &str,
+) -> Result<Io> {
+    let (host, port) = target.rsplit_once(':').ok_or_else(|| anyhow!("bad target {target}"))?;
+    let port: u16 = port.parse()?;
+    if let Some(upstream) = &cfg.socks5 {
+        let sock = socks::connect_via_socks(upstream, host, port).await?;
+        let name = rustls_pki_types::ServerName::try_from(host.to_string())
+            .map_err(|_| anyhow!("bad server name {host}"))?;
+        let tls: TlsStream<TcpStream> = connector.connect(name, sock).await?;
+        return Ok(Box::new(tls));
+    }
+    let remote = resolve_host(resolver, host, port).await?;
+    let tcp = TcpStream::connect(remote).await?;
+    let name = rustls_pki_types::ServerName::try_from(host.to_string())
+        .map_err(|_| anyhow!("bad server name {host}"))?;
+    let tls: TlsStream<TcpStream> = connector.connect(name, tcp).await?;
+    Ok(Box::new(tls))
+}
+
+/// Message-mode HTTP/1.1: write the request, read until the peer closes.
+async fn l7_roundtrip(sock: Arc<tokio::sync::Mutex<Io>>, req: &[u8]) -> Option<Vec<u8>> {
+    let mut s = sock.lock().await;
+    s.write_all(req).await.ok()?;
+    s.flush().await.ok()?;
+    let _ = s.shutdown().await;
+    let mut buf = Vec::with_capacity(64 * 1024);
+    s.read_to_end(&mut buf).await.ok()?;
+    Some(buf)
+}
+
+fn spawn_io_pump(
     sid: u32,
     handle: StreamHandle,
     tx: tokio::sync::mpsc::Sender<Vec<u8>>,
@@ -218,7 +358,7 @@ fn spawn_stream_pump(
 ) {
     tokio::spawn(async move {
         match handle {
-            StreamHandle::Tcp(sock) => {
+            StreamHandle::Io(sock) => {
                 let mut buf = [0u8; 64 * 1024];
                 loop {
                     let n = {
@@ -251,3 +391,5 @@ fn spawn_stream_pump(
         streams.remove(&sid);
     });
 }
+
+

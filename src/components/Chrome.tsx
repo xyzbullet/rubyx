@@ -382,6 +382,23 @@ export function StatusBar() {
     const iv = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(iv);
   }, []);
+  const [rep, setRep] = useState<{ engine: string; transport: string }>({
+    engine: "JS-FALLBACK",
+    transport: "local",
+  });
+  useEffect(() => {
+    const onMsg = (e: MessageEvent) => {
+      const m = e.data as { type?: string; engine?: string; transport?: string } | null;
+      if (!m) return;
+      if (m.type === "pong") setRep({ engine: m.engine || "JS-FALLBACK", transport: m.transport || "local" });
+      if (m.type === "tunnel" && m.transport) {
+        const t = m.transport;
+        setRep((r) => ({ ...r, transport: t }));
+      }
+    };
+    navigator.serviceWorker?.addEventListener("message", onMsg);
+    return () => navigator.serviceWorker?.removeEventListener("message", onMsg);
+  }, []);
   const tab = s.tabs.find((t) => t.id === s.active) as Tab;
   const bytes = s.net.reduce((a, n) => a + (n.size || 0), 0);
   const host = tab.url ? hostOf(tab.url) : "wraith://start";
@@ -390,8 +407,8 @@ export function StatusBar() {
     <div className="flex h-[26px] shrink-0 items-center justify-between gap-4 overflow-hidden border-t border-edge bg-bg1 px-3 font-mono text-[10.5px] tracking-wide text-dim select-none">
       <div className="flex items-center gap-3">
         <span className="flex items-center gap-1.5">
-          <span className={`pulse-dot h-[7px] w-[7px] rounded-full ${s.latency != null ? "bg-mint" : "bg-edge2"}`} />
-          WISP/{s.settings.transport === "ws" ? "WS" : "POLL"}
+          <span className={`pulse-dot h-[7px] w-[7px] rounded-full ${s.latency != null ? (rep.transport === "wisp-e2ee" ? "bg-mint" : "bg-amber") : "bg-edge2"}`} />
+          {rep.transport === "wisp-e2ee" ? "WISP·E2EE" : rep.transport === "local" ? "SW·LOCAL" : "WISP/POLL"}
         </span>
         <span className="hidden text-mute sm:inline">{s.settings.gateway ? hostOf(s.settings.gateway) : "local-sim"}</span>
         <span className="tabular text-mute">{s.latency != null ? `${s.latency}ms` : "—"}</span>
@@ -402,7 +419,7 @@ export function StatusBar() {
         {s.cloak && <span className="rounded-sm border border-amber/40 bg-amber/10 px-1 text-amber">CLOAKED</span>}
       </div>
       <div className="flex items-center gap-3">
-        <span className="hidden md:inline">ENGINE·JS-FALLBACK</span>
+        <span className={`hidden md:inline ${rep.engine === "WASM" ? "text-mint" : ""}`}>ENGINE·{rep.engine}</span>
         <span className="hidden text-mute md:inline">{st.total} rules</span>
         <span className="text-amber">{s.blocked} blk</span>
         <span className="hidden text-mute lg:inline">{(bytes / 1024).toFixed(1)}KB</span>
