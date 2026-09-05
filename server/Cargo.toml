@@ -1,0 +1,28 @@
+[package]
+name = "wraith-server"
+version = "0.9.2"
+edition = "2021"
+description = "High-concurrency wisp tunnel node: WebSocket stream multiplexing, SOCKS5 egress, Tor bridge, on-node DNS."
+license = "MIT"
+
+[[bin]]
+name = "wraith-server"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+hickory-resolver = "0.24"
+dashmap = "6"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+bytes = "1"
+url = "2"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
