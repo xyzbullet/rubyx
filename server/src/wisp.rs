@@ -1,7 +1,7 @@
 //! Wisp frame multiplexer over WebSocket.
 //!
 //! Frame layout (little-endian):
-//!   u32 length (payload only) | u8 type | u32 stream_id | payload
+//!   u32 length (payload + 5) | u8 type | u32 stream_id | payload
 //!
 //!   type 0x01 CONNECT  payload: u8 proto (1=tcp,2=udp) | utf8 "host:port"
 //!   type 0x02 DATA     payload: raw bytes
@@ -16,11 +16,10 @@
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
-use bytes::{Buf, BytesMut};
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use hickory_resolver::{
-    config::{ResolverConfig, ResolverOpts},
+    config::{NameServerConfig, Protocol, ResolverConfig, ResolverOpts},
     TokioAsyncResolver,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -45,23 +44,21 @@ const T_EXTEND: u8 = 0x05;
 #[derive(Clone)]
 enum StreamHandle {
     Tcp(Arc<tokio::sync::Mutex<TcpStream>>),
-    Udp(Arc<UdpSocket>, std::net::SocketAddr),
+    Udp(Arc<UdpSocket>),
 }
 
 type Streams = Arc<DashMap<u32, StreamHandle>>;
 
-fn resolver(cfg: &Config) -> Result<TokioAsyncResolver> {
+fn make_resolver(cfg: &Config) -> Result<TokioAsyncResolver> {
     let mut opts = ResolverOpts::default();
     opts.cache_size = 4096;
     let server = cfg.dns.parse().context("bad --dns addr")?;
+    // `new` is the stable cross-version constructor (0.21 → 0.25+);
+    // field literals differ across minors, so they are avoided on purpose.
+    let mut ns = NameServerConfig::new(server, Protocol::Udp);
+    ns.trust_negative_responses = true;
     Ok(TokioAsyncResolver::tokio(
-        ResolverConfig::from_parts(None, vec![], vec![hickory_resolver::config::NameServerConfig {
-            socket_addr: server,
-            protocol: hickory_resolver::config::Protocol::Udp,
-            tls_dns_name: None,
-            trust_negative_responses: true,
-            bind_addr: None,
-        }]),
+        ResolverConfig::from_parts(None, vec![], vec![ns]),
         opts,
     ))
 }
@@ -73,13 +70,13 @@ pub async fn serve_conn(stream: TcpStream, cfg: Arc<Config>) -> Result<()> {
     let (mut sink, mut rx) = ws.split();
 
     let streams: Streams = Arc::new(DashMap::new());
-    let resolver = Arc::new(resolver(&cfg)?);
+    let dns = Arc::new(make_resolver(&cfg)?);
     let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1024);
 
     // egress pump: frames produced by per-stream readers -> ws sink
     let pump = tokio::spawn(async move {
-        while let Some(frame) = frame_rx.recv().await {
-            if sink.send(Message::Binary(frame.into())).await.is_err() {
+        while let Some(f) = frame_rx.recv().await {
+            if sink.send(Message::Binary(f.into())).await.is_err() {
                 break;
             }
         }
@@ -93,10 +90,13 @@ pub async fn serve_conn(stream: TcpStream, cfg: Arc<Config>) -> Result<()> {
         };
         match ty {
             T_CONNECT => {
-                let proto = payload.first().copied().unwrap_or(1);
+                if payload.len() < 2 {
+                    continue;
+                }
+                let proto = payload[0];
                 let target = String::from_utf8_lossy(&payload[1..]).to_string();
                 info!("stream {sid} connect {} -> {target}", if proto == 2 { "udp" } else { "tcp" });
-                let handle = open_stream(&cfg, &resolver, proto, &target).await?;
+                let handle = open_stream(&cfg, &dns, proto, &target).await?;
                 streams.insert(sid, handle.clone());
                 spawn_stream_pump(sid, handle, frame_tx.clone(), streams.clone());
             }
@@ -112,10 +112,14 @@ pub async fn serve_conn(stream: TcpStream, cfg: Arc<Config>) -> Result<()> {
                 }
             }
             T_UDP => {
-                if payload.len() < 2 { continue; }
+                if payload.len() < 2 {
+                    continue;
+                }
                 let alen = u16::from_be_bytes([payload[0], payload[1]]) as usize;
-                if payload.len() < 2 + alen { continue; }
-                if let Some(StreamHandle::Udp(sock, _)) = streams.get(&sid).map(|h| h.value().clone()) {
+                if payload.len() < 2 + alen {
+                    continue;
+                }
+                if let Some(StreamHandle::Udp(sock)) = streams.get(&sid).map(|h| h.value().clone()) {
                     let datagram = payload[2 + alen..].to_vec();
                     tokio::spawn(async move {
                         let _ = sock.send(&datagram).await;
@@ -137,20 +141,20 @@ pub async fn serve_conn(stream: TcpStream, cfg: Arc<Config>) -> Result<()> {
     Ok(())
 }
 
+/// Parse one wisp frame. Works over any `Deref<Target = [u8]>` payload
+/// (tungstenite `Bytes` or `Vec<u8>`) — no `as_ref` inference games.
 fn decode(msg: Message) -> Option<(u8, u32, Vec<u8>)> {
     let data = match msg {
         Message::Binary(b) => b,
-        Message::Close(_) => None?,
         _ => return None,
     };
-    let mut buf = BytesMut::from(data.as_ref());
-    if buf.len() < 9 {
+    let bytes: &[u8] = &data;
+    if bytes.len() < 9 {
         return None;
     }
-    let _len = buf.get_u32_le();
-    let ty = buf.get_u8();
-    let sid = buf.get_u32_le();
-    Some((ty, sid, buf.to_vec()))
+    let ty = bytes[4];
+    let sid = u32::from_le_bytes(bytes[5..9].try_into().ok()?);
+    Some((ty, sid, bytes[9..].to_vec()))
 }
 
 fn frame(ty: u8, sid: u32, payload: &[u8]) -> Vec<u8> {
@@ -164,14 +168,17 @@ fn frame(ty: u8, sid: u32, payload: &[u8]) -> Vec<u8> {
 
 async fn open_stream(
     cfg: &Config,
-    resolver: &TokioAsyncResolver,
+    dns: &TokioAsyncResolver,
     proto: u8,
     target: &str,
 ) -> Result<StreamHandle> {
-    let (host, port) = target.rsplit_once(':').ok_or_else(|| anyhow!("bad target {target}"))?;
-    let port: u16 = port.parse()?;
+    let (host, port) = target
+        .rsplit_once(':')
+        .ok_or_else(|| anyhow!("bad target {target}"))?;
+    let port: u16 = port.parse().context("bad port")?;
 
-    // .onion destinations bridge via the local Tor SOCKS listener
+    // .onion destinations bridge via the local Tor SOCKS listener;
+    // hostnames go verbatim (ATYP 0x03) so resolution stays inside the circuit.
     if host.ends_with(".onion") {
         let sock = socks::connect_via_socks(&cfg.tor_socks, host, port).await?;
         return Ok(StreamHandle::Tcp(Arc::new(tokio::sync::Mutex::new(sock))));
@@ -183,21 +190,32 @@ async fn open_stream(
     }
 
     if proto == 2 {
-        let addrs = resolver.lookup_ip(host).await?;
-        let remote = std::net::SocketAddr::new(addrs.iter().next().ok_or_else(|| anyhow!("no A/AAAA"))?, port);
+        let addrs = dns.lookup_ip(host).await?;
+        let ip = addrs
+            .iter()
+            .next()
+            .ok_or_else(|| anyhow!("no A/AAAA records for {host}"))?;
         let sock = UdpSocket::bind("0.0.0.0:0").await?;
-        sock.connect(remote).await?;
-        Ok(StreamHandle::Udp(Arc::new(sock), remote))
+        sock.connect(std::net::SocketAddr::new(ip, port)).await?;
+        Ok(StreamHandle::Udp(Arc::new(sock)))
     } else {
-        let addrs = resolver.lookup_ip(host).await?;
-        let remote = std::net::SocketAddr::new(addrs.iter().next().ok_or_else(|| anyhow!("no A/AAAA"))?, port);
-        let sock = TcpStream::connect(remote).await?;
+        let addrs = dns.lookup_ip(host).await?;
+        let ip = addrs
+            .iter()
+            .next()
+            .ok_or_else(|| anyhow!("no A/AAAA records for {host}"))?;
+        let sock = TcpStream::connect(std::net::SocketAddr::new(ip, port)).await?;
         sock.set_nodelay(true)?;
         Ok(StreamHandle::Tcp(Arc::new(tokio::sync::Mutex::new(sock))))
     }
 }
 
-fn spawn_stream_pump(sid: u32, handle: StreamHandle, tx: tokio::sync::mpsc::Sender<Vec<u8>>, streams: Streams) {
+fn spawn_stream_pump(
+    sid: u32,
+    handle: StreamHandle,
+    tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    streams: Streams,
+) {
     tokio::spawn(async move {
         match handle {
             StreamHandle::Tcp(sock) => {
@@ -216,7 +234,7 @@ fn spawn_stream_pump(sid: u32, handle: StreamHandle, tx: tokio::sync::mpsc::Send
                     }
                 }
             }
-            StreamHandle::Udp(sock, _) => {
+            StreamHandle::Udp(sock) => {
                 let mut buf = [0u8; 64 * 1024];
                 loop {
                     match sock.recv(&mut buf).await {

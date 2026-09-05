@@ -192,9 +192,6 @@ impl NetRule {
             if seg_match(&self.segs, bytes, st, self.end_anchored) {
                 return true;
             }
-            if self.start_anchored || self.host_anchored && st == starts[0] && self.segs.first().map(|s| matches!(s, Seg::Lit(_))) == Some(false) {
-                // host-anchored rules still try subdomain starts above; keep looping
-            }
         }
         false
     }
