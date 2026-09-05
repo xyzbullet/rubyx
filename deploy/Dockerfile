@@ -1,18 +1,22 @@
 # syntax=docker/dockerfile:1.7
 # ============================================================
 # Wraith — multi-stage production image
-#   stage 1: rust wisp node  (server/)
+#   stage 1: rust wisp node (server/)   — Debian/glibc toolchain
 #   stage 2: frontend bundle (vite build)
-#   runtime: nginx (shell) + wraith-server (tunnel) + optional tor
+#   runtime: nginx + wraith-server tunnel
 # ============================================================
 
-# ≥ 1.85 required: transitive deps (url → idna → icu_properties_data 2.x)
+# >= 1.85 required: transitive deps (url -> idna -> icu_properties_data 2.x)
 # are published with edition2024, stabilized in Rust 1.85.0
 FROM rust:1.88-slim-bookworm AS rust
 WORKDIR /build
 COPY server/Cargo.toml server/Cargo.toml
 COPY server/src server/src
-RUN cargo build --release --manifest-path server/Cargo.toml
+# Pin the target dir so COPY --from has a stable, predictable path
+# regardless of where cargo would otherwise place it relative to the manifest.
+ENV CARGO_TARGET_DIR=/build/target
+RUN cargo build --release --manifest-path server/Cargo.toml \
+  && test -x /build/target/release/wraith-server
 
 FROM node:20-slim AS web
 WORKDIR /app
@@ -21,8 +25,11 @@ RUN npm ci
 COPY . .
 RUN npm run build
 
-FROM nginx:1.27-alpine AS runtime
-# tunnel binary
+# NOTE: glibc base (not alpine) — the wisp binary links against the Debian
+# toolchain from stage 1 and cannot exec on musl.
+FROM nginx:1.27-bookworm AS runtime
+
+# tunnel binary (fail fast with a clear message if the path ever drifts)
 COPY --from=rust /build/target/release/wraith-server /usr/local/bin/wraith-server
 # frontend shell
 COPY --from=web /app/dist /usr/share/nginx/html
