@@ -1,0 +1,23 @@
+[package]
+name = "wraith_engine"
+version = "0.9.2"
+edition = "2021"
+description = "Wraith rewrite + ABP-compatible filter engine, compiled to WASM via wasm-pack for the service worker."
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wasm-bindgen = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde-wasm-bindgen = "0.6"
+js-sys = "0.3"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+
+# Build:  wasm-pack build --release --target web --out-dir ../public/wasm

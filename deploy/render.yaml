@@ -1,0 +1,17 @@
+# Render blueprint — one Docker service serving shell + wisp node.
+# The node keeps WebSockets alive (persistent instance type); clients on
+# ephemeral instances degrade to the HTTP polling transport automatically.
+services:
+  - type: web
+    name: wraith
+    runtime: docker
+    plan: starter
+    dockerfilePath: deploy/Dockerfile
+    dockerContext: .
+    healthCheckPath: /
+    autoDeploy: true
+    envVars:
+      - key: TOR_SOCKS
+        value: 127.0.0.1:9050
+      - key: SOCKS5
+        sync: false # set per-deploy for regional exit swapping

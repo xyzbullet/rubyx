@@ -1,0 +1,21 @@
+# Koyeb app manifest — deploy with:
+#   koyeb app init wraith --dockerfile deploy/Dockerfile --docker-entrypoint /entrypoint.sh
+name: wraith
+services:
+  - name: wraith-shell
+    type: web
+    dockerfile: deploy/Dockerfile
+    regions:
+      - fra
+      - was
+    ports:
+      - port: 8080
+    env:
+      TOR_SOCKS: 127.0.0.1:9050
+    healthchecks:
+      http:
+        path: /
+        port: 8080
+    scaling:
+      min: 1
+      max: 3

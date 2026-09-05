@@ -1,0 +1,25 @@
+version: "3.9"
+
+# Local full stack: shell + wisp tunnel + optional tor bridge.
+#   docker compose -f deploy/docker-compose.yml up --build
+
+services:
+  wraith:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      # Regional exit swap — point at any SOCKS5 upstream:
+      # SOCKS5: "geo-exit.example:1080"
+      TOR_SOCKS: "tor:9050"
+    depends_on:
+      - tor
+    restart: unless-stopped
+
+  tor:
+    image: dperson/torproxy:latest
+    restart: unless-stopped
+    # exposes SOCKS on 9050 inside the compose network;
+    # .onion targets from the wisp node bridge through it
