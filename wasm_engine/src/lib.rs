@@ -9,7 +9,7 @@
 
 mod filters;
 
-use filters::{Engine, ResourceType, Verdict};
+use filters::{Engine, ResourceType, VerdictKind};
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
@@ -44,7 +44,7 @@ impl WraithEngine {
         third_party: bool,
     ) -> JsValue {
         let rt = ResourceType::parse(rtype);
-        let v: Verdict = self.inner.match_network(url, origin, rt, third_party);
+        let v = self.inner.match_network(url, origin, rt, third_party);
         serde_wasm_bindgen::to_value(&v).unwrap_or(JsValue::NULL)
     }
 
@@ -57,9 +57,8 @@ impl WraithEngine {
         serde_wasm_bindgen::to_value(&self.inner.stats()).unwrap_or(JsValue::NULL)
     }
 
-    /// Rewrite an HTML document: absolutize relative URLs against the
-    /// request origin, route navigable/resource URLs through the proxy
-    /// prefix, and strip script tags whose src hits a blocked host.
+    /// Rewrite an HTML document: route navigable/resource URLs through the
+    /// proxy prefix and strip script tags whose src hits a blocked host.
     pub fn rewrite_html(&self, html: &str, origin: &str) -> String {
         rewrite::html(html, origin, &self.proxy_prefix, &self.inner)
     }
@@ -99,79 +98,114 @@ impl WraithEngine {
 /* ------------------------------------------------------------ rewriter */
 
 mod rewrite {
-    use crate::filters::{Engine, ResourceType};
+    use crate::filters::{Engine, ResourceType, VerdictKind};
 
     const URL_ATTRS: &[&str] = &["src=", "href=", "action=", "poster=", "srcset="];
 
+    fn has_scheme(url: &str) -> bool {
+        url.contains("://")
+            || url.starts_with("data:")
+            || url.starts_with("javascript:")
+            || url.starts_with("mailto:")
+            || url.starts_with("about:")
+    }
+
     fn absolutize(url: &str, origin: &str) -> String {
-        if url.starts_with("http://") || url.starts_with("https://") || url.starts_with("data:") {
+        if has_scheme(url) {
             url.to_string()
-        } else if url.starts_with("//") {
-            format!("https:{url}")
-        } else if url.starts_with('/') {
-            format!("{origin}{url}")
+        } else if let Some(rest) = url.strip_prefix("//") {
+            format!("https://{rest}")
+        } else if let Some(rest) = url.strip_prefix('/') {
+            format!("{origin}/{rest}")
         } else {
             format!("{origin}/{url}")
         }
     }
 
+    /// Extract the quoted value following `attr=` (case-insensitive hit).
+    fn quoted_value<'a>(tag: &'a str, tag_lower: &str, attr: &str) -> Option<&'a str> {
+        let pos = tag_lower.find(attr)?;
+        let rest = &tag[pos + attr.len()..];
+        let mut rb = rest.as_bytes();
+        // tolerate whitespace between = and the quote
+        let mut skip = 0;
+        while skip < rb.len() && (rb[skip] == b' ' || rb[skip] == b'\t') {
+            skip += 1;
+        }
+        rb = &rb[skip..];
+        let quote = *rb.first()?;
+        if quote != b'"' && quote != b'\'' {
+            return None;
+        }
+        let inner = &rest[skip + 1..];
+        let end = inner.find(quote as char)?;
+        Some(&inner[..end])
+    }
+
     pub fn html(doc: &str, origin: &str, prefix: &str, engine: &Engine) -> String {
+        // lower-cased twin keeps byte offsets aligned for tag scanning
+        let lower = doc.to_ascii_lowercase();
         let mut out = String::with_capacity(doc.len() + 1024);
-        let bytes = doc.as_bytes();
         let mut i = 0;
 
-        while i < bytes.len() {
-            // drop <script src="…blocked-host…"> tags entirely
-            if bytes[i] == b'<' && doc[i..].get(..7).map(|s| s.eq_ignore_ascii_case("<script")) == Some(true) {
-                if let Some(end) = doc[i..].find('>') {
-                    let tag = &doc[i..i + end + 1];
-                    if let Some(src_pos) = tag.to_ascii_lowercase().find("src=") {
-                        let rest = &tag[src_pos + 5..];
-                        let quote = rest.as_bytes().first().copied().unwrap_or(b'"');
-                        if let Some(q2) = rest[1..].find(quote as char) {
-                            let src = &rest[1..1 + q2];
-                            let abs = absolutize(src, origin);
-                            let v = engine.match_network(&abs, origin, ResourceType::Script, true);
-                            if v.verdict == "block" {
-                                i += end + 1; // swallow the opening tag; </script> is inert without src
-                                continue;
-                            }
+        while i < doc.len() {
+            if lower[i..].starts_with("<script") {
+                if let Some(rel) = doc[i..].find('>') {
+                    let tag = &doc[i..i + rel + 1];
+                    let tag_lower = &lower[i..i + rel + 1];
+                    let mut drop_tag = false;
+                    if let Some(src) = quoted_value(tag, tag_lower, "src=") {
+                        let abs = absolutize(src, origin);
+                        if engine.match_network(&abs, origin, ResourceType::Script, true).verdict
+                            == VerdictKind::Block
+                        {
+                            drop_tag = true;
                         }
                     }
+                    if drop_tag {
+                        i += rel + 1;
+                        continue;
+                    }
+                    out.push_str(tag);
+                    i += rel + 1;
+                    continue;
                 }
             }
-            out.push(bytes[i] as char);
-            i += 1;
+            // copy one UTF-8 char at a time (byte-slicing a &str must stay on boundaries)
+            let ch = doc[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
         }
 
-        // attribute pass (kept separate for clarity; single allocation)
+        // attribute pass — single allocation, positions recomputed per attr
         let mut rewritten = out;
         for attr in URL_ATTRS {
             let mut idx = 0;
-            while let Some(pos) = rewritten[idx..].to_ascii_lowercase().find(attr) {
+            while idx < rewritten.len() {
+                let hay = rewritten[idx..].to_ascii_lowercase();
+                let Some(pos) = hay.find(attr) else { break };
                 let start = idx + pos + attr.len();
-                let b = rewritten.as_bytes();
-                if start >= b.len() {
+                if start >= rewritten.len() {
                     break;
                 }
-                let quote = b[start] as char;
-                if quote != '"' && quote != '\'' {
+                let bytes = rewritten.as_bytes();
+                let quote = bytes[start];
+                if quote != b'"' && quote != b'\'' {
                     idx = start;
                     continue;
                 }
-                if let Some(end) = rewritten[start + 1..].find(quote) {
-                    let url = &rewritten[start + 1..start + 1 + end];
-                    if !url.starts_with("data:") && !url.starts_with("javascript:") && !url.starts_with('#') {
-                        let abs = absolutize(url, origin);
-                        let proxied = format!("{prefix}{abs}");
-                        rewritten.replace_range(start + 1..start + 1 + end, &proxied);
-                        idx = start + 1 + proxied.len();
-                    } else {
-                        idx = start + 1 + end;
-                    }
-                } else {
+                let Some(end) = rewritten[start + 1..].find(quote as char) else {
                     break;
+                };
+                let url = &rewritten[start + 1..start + 1 + end];
+                if url.is_empty() || has_scheme(url) || url.starts_with('#') {
+                    idx = start + 1 + end;
+                    continue;
                 }
+                let abs = absolutize(url, origin);
+                let proxied = format!("{prefix}{abs}");
+                rewritten.replace_range(start + 1..start + 1 + end, &proxied);
+                idx = start + 1 + proxied.len();
             }
         }
         rewritten
@@ -181,14 +215,16 @@ mod rewrite {
     pub fn js(src: &str, prefix: &str) -> String {
         let mut out = String::with_capacity(src.len() + 256);
         let mut rest = src;
-        while let Some(pos) = rest.find("https://").or_else(|| rest.find("http://")) {
-            let p = match (rest.find("https://"), rest.find("http://")) {
-                (Some(a), Some(b)) => a.min(b),
+        loop {
+            let https = rest.find("https://");
+            let http = rest.find("http://");
+            let p = match (https, http) {
+                (None, None) => break,
                 (Some(a), None) => a,
-                (None, b) => b.unwrap(),
+                (None, Some(b)) => b,
+                (Some(a), Some(b)) => a.min(b),
             };
             out.push_str(&rest[..p]);
-            // find literal end (quote or backtick or whitespace)
             let tail = &rest[p..];
             let end = tail
                 .find(|c: char| c == '"' || c == '\'' || c == '`' || c.is_whitespace())
@@ -210,7 +246,7 @@ mod rewrite {
             let tail = &rest[start..];
             let end = tail.find(')').unwrap_or(tail.len());
             let raw = tail[..end].trim().trim_matches(|c| c == '"' || c == '\'');
-            if raw.starts_with("http") {
+            if raw.starts_with("http://") || raw.starts_with("https://") {
                 out.push_str(prefix);
             }
             out.push_str(&tail[..end]);
